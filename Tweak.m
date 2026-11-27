@@ -1,11 +1,12 @@
-// hpke_dumper v6 — ZERO runtime class scanning, pure string discovery
-// crash history: v3-v5 all crash from walking ObjC class lists/pointers
-// v6: only objc_getClass by name (safe) + mach-o string search (no runtime)
+// hpke_dumper v7 — full-image string scan for selector discovery
+// v6 searched only __TEXT,__objc_methnames — IG 454.1 (407MB, chained fixups)
+// may store selectors elsewhere. v7 scans ALL segments.
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <time.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <mach-o/loader.h>
 #include <string.h>
 
 static NSFileHandle *gFH;
@@ -32,8 +33,8 @@ static EncFn o_enc;
 static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, void *aad) {
     void *result = o_enc(self, _cmd, data, pk, info, aad);
     @try {
-        NSMutableString *L = [NSMutableString stringWithFormat:@"\n==== HPKE ENCRYPT ====\nClass: %s\n",
-            class_getName([(__bridge id)self class])];
+        NSMutableString *L = [NSMutableString stringWithFormat:@"\n==== HPKE ENCRYPT ====\nClass: %s\nSEL: %s\n",
+            class_getName([(__bridge id)self class]), sel_getName(_cmd)];
         NSData *pkD = (__bridge NSData *)pk;
         if (pkD && [pkD respondsToSelector:@selector(length)])
             [L appendFormat:@"SERVER_PK_HEX: %@\nSERVER_PK_B64: %@\nSERVER_PK_LEN: %lu\n",
@@ -73,8 +74,21 @@ static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, vo
     return result;
 }
 
-// ---- Known class names (safe: objc_getClass returns nil) ----
-static const char *kCandidates[] = {
+// ---- All selectors to try (exact + alternative names from spec) ----
+static const char *kSelectors[] = {
+    "encryptData:withPublicKey:withInfo:withAad:",
+    "encryptData:withPublicKey:withInfo:withAAD:",
+    "encryptData:publicKey:info:aad:",
+    "encryptDataPadded:withPublicKey:withInfo:withAad:",
+    "encryptDataPadded:withPublicKey:withInfo:withAAD:",
+    "encryptStringPadded:withPublicKey:withInfo:withAad:",
+    "_encryptAndUploadData:forGroup:forUseCase:successCallback:failureCallback:",
+    "uploadE2EEData:forGroup:ofUseCase:uploadCallback:",
+    NULL
+};
+
+// ---- Known class names ----
+static const char *kClasses[] = {
     "FBHPKEEncryptor", "IGHPKEEncryptor",
     "FBEncryptionUtils", "IGEncryptionUtils",
     "FBHPKECryptoHelper", "IGHPKECryptoHelper",
@@ -88,144 +102,149 @@ static const char *kCandidates[] = {
     "FBCryptoService", "IGCryptoService",
     "FBPublicKeyEncryption", "IGPublicKeyEncryption",
     "FBHybridPublicKeyEncryption", "IGHybridPublicKeyEncryption",
-    "FBKeyEncapsulation", "IGKeyEncapsulation",
-    "FBSealedBox", "IGSealedBox",
-    "FBDeviceBasedRecoveryEncryption", "IGDeviceBasedRecoveryEncryption",
-    "FBRecoveryEncryption", "IGRecoveryEncryption",
-    "FBIdentityVerificationEncryption", "IGIdentityVerificationEncryption",
-    "FBAuthenticityEncryption", "IGAuthenticityEncryption",
-    "FBSignalEncryption", "IGSignalEncryption",
-    "FBContentEncryption", "IGContentEncryption",
     "FBEEEncryptor", "IGEEEncryptor",
     "FBEnrichmentEncryptor", "IGEnrichmentEncryptor",
-    "FBMediumEnrichmentEncryptor", "IGMediumEnrichmentEncryptor",
-    "FBSelfieEncryptor", "IGSelfieEncryptor",
-    "FBIDVEncryptor", "IGIDVEncryptor",
+    "FBContentEncryption", "IGContentEncryption",
+    "FBAuthenticityEncryption", "IGAuthenticityEncryption",
+    "AuthenticityOnDeviceSignalsTracker",
+    "IGAuthenticityOnDeviceSignalsTracker",
+    "FBAuthenticityOnDeviceSignalsTracker",
     NULL
 };
 
-static BOOL tryKnownClasses(void) {
-    SEL sel = sel_registerName("encryptData:withPublicKey:withInfo:withAad:");
-    for (int i = 0; kCandidates[i]; i++) {
-        Class c = objc_getClass(kCandidates[i]);
-        if (!c) continue;
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        o_enc = (EncFn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)my_enc);
-        emit([NSString stringWithFormat:@"HOOKED %s", kCandidates[i]]);
-        gHooked = YES;
-        return YES;
+static BOOL tryKnown(void) {
+    for (int s = 0; kSelectors[s]; s++) {
+        SEL sel = sel_registerName(kSelectors[s]);
+        for (int c = 0; kClasses[c]; c++) {
+            Class cls = objc_getClass(kClasses[c]);
+            if (!cls) continue;
+            Method m = class_getInstanceMethod(cls, sel);
+            if (!m) m = class_getClassMethod(cls, sel);
+            if (!m) continue;
+            o_enc = (EncFn)method_getImplementation(m);
+            method_setImplementation(m, (IMP)my_enc);
+            emit([NSString stringWithFormat:@"HOOKED %s -[%s]", kClasses[c], kSelectors[s]]);
+            gHooked = YES;
+            return YES;
+        }
     }
     return NO;
 }
 
-// ---- SAFE discovery: pure string scan of __objc_classnames + __objc_methnames ----
-// NO runtime calls on classes. Just reads readonly mach-o sections.
-static void safeDiscovery(void) {
-    const char *targetSel = "encryptData:withPublicKey:withInfo:withAad:";
-    size_t selLen = strlen(targetSel);
-
-    // Keywords to filter interesting class names
-    const char *keywords[] = {
-        "ncrypt", "HPKE", "hpke", "Seal", "seal", "Cipher",
-        "PublicKey", "Hybrid", "AEAD", "aead", "EE", "Enrichment",
-        "enrichment", "Authenticity", "IDV", "idv", "Selfie",
-        "Recovery", "DeviceBased", "Signal", NULL
+// ---- Discovery: scan ALL segments of ALL images for selector substrings ----
+static void fullDiscovery(void) {
+    // Needle strings to look for anywhere in the binary
+    const char *needles[] = {
+        "encryptData:with",
+        "encryptData:pub",
+        "encryptDataPadded",
+        "encryptStringPadded",
+        "encryptAndUploadData",
+        "uploadE2EEData",
+        "HPKE_0020",
+        "3P_CONV_ENC",
+        "recipientPkB64url",
+        NULL
     };
 
-    NSMutableString *out = [NSMutableString stringWithString:@"\n==== DISCOVERY (string scan) ====\n"];
+    NSMutableString *out = [NSMutableString stringWithString:@"\n==== FULL IMAGE DISCOVERY ====\n"];
     uint32_t imgCount = _dyld_image_count();
-    BOOL selFound = NO;
+    [out appendFormat:@"Total loaded images: %u\n", imgCount];
 
-    for (uint32_t img = 0; img < imgCount; img++) {
-        const struct mach_header *mh = _dyld_get_image_header(img);
-        if (!mh || mh->magic != MH_MAGIC_64) continue;
+    // Only scan first few images (main binary + key frameworks)
+    uint32_t scanLimit = imgCount < 15 ? imgCount : 15;
 
-        // Check if this image has our selector in __objc_methnames
-        unsigned long mnSize = 0;
-        const uint8_t *methnames = getsectiondata((const struct mach_header_64 *)mh,
-            "__TEXT", "__objc_methnames", &mnSize);
-        if (!methnames || mnSize < selLen) continue;
-
-        BOOL hasSel = NO;
-        for (unsigned long off = 0; off + selLen <= mnSize; off++) {
-            if (methnames[off] == 'e' && memcmp(methnames + off, targetSel, selLen) == 0
-                && methnames[off + selLen] == '\0') {
-                hasSel = YES;
-                break;
-            }
-        }
-        if (!hasSel) continue;
-
+    for (uint32_t img = 0; img < scanLimit; img++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(img);
+        if (!mh || mh->header.magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(img);
         const char *imgName = _dyld_get_image_name(img);
-        [out appendFormat:@"IMAGE %u has selector: %s\n", img, imgName ?: "?"];
-        selFound = YES;
 
-        // Now scan __objc_classname in this image for crypto-related class names
-        unsigned long cnSize = 0;
-        const uint8_t *classnames = getsectiondata((const struct mach_header_64 *)mh,
-            "__TEXT", "__objc_classname", &cnSize);
-        if (!classnames) continue;
+        // Walk load commands to find all segments
+        const uint8_t *ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
+        int foundInImage = 0;
 
-        int hits = 0;
-        unsigned long pos = 0;
-        while (pos < cnSize && hits < 100) {
-            const char *name = (const char *)(classnames + pos);
-            size_t nLen = strnlen(name, cnSize - pos);
-            if (nLen == 0) { pos++; continue; }
+        for (uint32_t cmd = 0; cmd < mh->header.ncmds && foundInImage < 20; cmd++) {
+            const struct load_command *lc = (const struct load_command *)ptr;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+                // Skip __LINKEDIT (huge, no strings), __PAGEZERO
+                if (strcmp(seg->segname, "__LINKEDIT") == 0 || strcmp(seg->segname, "__PAGEZERO") == 0) {
+                    ptr += lc->cmdsize;
+                    continue;
+                }
 
-            // Check if name contains any keyword
-            for (int k = 0; keywords[k]; k++) {
-                if (strstr(name, keywords[k])) {
-                    [out appendFormat:@"  CLASS: %s\n", name];
-                    hits++;
+                const struct section_64 *sections = (const struct section_64 *)(ptr + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects && foundInImage < 20; s++) {
+                    const uint8_t *data = (const uint8_t *)(sections[s].addr + slide);
+                    uint64_t size = sections[s].size;
+                    if (size < 10 || size > 300 * 1024 * 1024) continue;
 
-                    // Try to hook it right now via objc_getClass (safe)
-                    if (!gHooked) {
-                        Class c = objc_getClass(name);
-                        if (c) {
-                            SEL sel = sel_registerName("encryptData:withPublicKey:withInfo:withAad:");
-                            Method m = class_getInstanceMethod(c, sel);
-                            if (m) {
-                                o_enc = (EncFn)method_getImplementation(m);
-                                method_setImplementation(m, (IMP)my_enc);
-                                [out appendFormat:@"  >>> HOOKED %s <<<\n", name];
-                                gHooked = YES;
+                    for (int n = 0; needles[n]; n++) {
+                        size_t nLen = strlen(needles[n]);
+                        if (nLen > size) continue;
+
+                        // Safe bounded search
+                        for (uint64_t off = 0; off + nLen <= size; off++) {
+                            if (data[off] == needles[n][0] && memcmp(data + off, needles[n], nLen) == 0) {
+                                // Found! Log context: 80 chars around the match
+                                uint64_t ctx_start = off > 40 ? off - 40 : 0;
+                                uint64_t ctx_end = off + nLen + 40;
+                                if (ctx_end > size) ctx_end = size;
+                                NSMutableString *ctx = [NSMutableString new];
+                                for (uint64_t i = ctx_start; i < ctx_end; i++) {
+                                    char c = (char)data[i];
+                                    [ctx appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
+                                }
+                                [out appendFormat:@"HIT img=%u seg=%.16s sect=%.16s off=0x%llx needle=%s\n  ctx: %@\n",
+                                    img, seg->segname, sections[s].sectname, (unsigned long long)off,
+                                    needles[n], ctx];
+                                foundInImage++;
+                                break; // next needle
                             }
                         }
                     }
-                    break;
                 }
             }
-            pos += nLen + 1;
+            ptr += lc->cmdsize;
         }
-        [out appendFormat:@"  (%d crypto-related classes found in this image)\n", hits];
+        if (foundInImage > 0)
+            [out appendFormat:@"  image: %s (%d hits)\n", imgName, foundInImage];
     }
 
-    if (!selFound) {
-        [out appendString:@"selector NOT found in ANY loaded image\n"];
+    // Also: dump __objc_methnames section info for diagnostics
+    const struct mach_header_64 *mainMH = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (mainMH) {
+        // Try all known section locations for methnames
+        const char *segs[] = {"__TEXT", "__DATA", "__DATA_CONST", "__OBJC", NULL};
+        const char *sects[] = {"__objc_methnames", "__objc_selrefs", "__methnames", NULL};
+        for (int sg = 0; segs[sg]; sg++) {
+            for (int sc = 0; sects[sc]; sc++) {
+                unsigned long sz = 0;
+                const uint8_t *d = getsectiondata(mainMH, segs[sg], sects[sc], &sz);
+                if (d && sz > 0)
+                    [out appendFormat:@"SECTION %s,%s exists: %lu bytes at %p\n", segs[sg], sects[sc], sz, d];
+            }
+        }
     }
-    if (!gHooked) {
-        [out appendString:@"HOOK NOT INSTALLED — add correct class name to kCandidates\n"];
-    }
+
     emit(out);
 }
 
 // ---- Retry ----
 static void retryInstall(int attempt) {
     if (gHooked) {
-        emit(@"READY — trigger selfie IDV to capture HPKE params");
+        emit(@"READY — trigger selfie IDV");
         return;
     }
-    if (attempt >= 30) {
-        emit(@"known names exhausted, running safe string discovery...");
-        safeDiscovery();
-        if (gHooked) emit(@"READY (via discovery) — trigger selfie IDV");
+    if (attempt >= 20) {
+        emit(@"known names exhausted, running full discovery...");
+        fullDiscovery();
+        if (!gHooked) emit(@"DISCOVERY DONE — check syslog/hpke_dump.txt for hits");
         return;
     }
-    if (tryKnownClasses()) {
-        emit(@"READY — trigger selfie IDV to capture HPKE params");
+    if (tryKnown()) {
+        emit(@"READY — trigger selfie IDV");
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -239,7 +258,7 @@ static void init(void) {
         gPath = [docs stringByAppendingPathComponent:@"hpke_dump.txt"];
         [[NSFileManager defaultManager] createFileAtPath:gPath contents:nil attributes:nil];
         gFH = [NSFileHandle fileHandleForWritingAtPath:gPath];
-        emit(@"hpke_dumper v6 loaded");
+        emit(@"hpke_dumper v7 loaded");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ retryInstall(0); });
     }
