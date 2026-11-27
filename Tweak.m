@@ -156,7 +156,7 @@ static void fullDiscovery(void) {
 
     for (uint32_t img = 0; img < scanLimit; img++) {
         const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(img);
-        if (!mh || mh->header.magic != MH_MAGIC_64) continue;
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(img);
         const char *imgName = _dyld_get_image_name(img);
 
@@ -164,7 +164,7 @@ static void fullDiscovery(void) {
         const uint8_t *ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
         int foundInImage = 0;
 
-        for (uint32_t cmd = 0; cmd < mh->header.ncmds && foundInImage < 20; cmd++) {
+        for (uint32_t cmd = 0; cmd < mh->ncmds && foundInImage < 20; cmd++) {
             const struct load_command *lc = (const struct load_command *)ptr;
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
