@@ -38,7 +38,7 @@ static int my_aead(unsigned char *c, unsigned long long *clen_p,
     const unsigned char *nsec, const unsigned char *npub, const unsigned char *k) {
     int ret = orig_aead_trampoline(c, clen_p, m, mlen, ad, adlen, nsec, npub, k);
     @try {
-        if (mlen > 1000) {
+        { // log ALL calls, no size filter
             emit(@"==== AEAD ENCRYPT ====");
             emit([NSString stringWithFormat:@"PT_LEN: %llu", mlen]);
             if (m) emit([NSString stringWithFormat:@"PT_HEAD: %@", hexOf(m, mlen < 64 ? (size_t)mlen : 64)]);
@@ -52,11 +52,13 @@ static int my_aead(unsigned char *c, unsigned long long *clen_p,
             if (npub) emit([NSString stringWithFormat:@"NONCE_12B: %@", hexOf(npub, 12)]);
             if (k) emit([NSString stringWithFormat:@"KEY_32B: %@", hexOf(k, 32)]);
             if (c && clen_p) emit([NSString stringWithFormat:@"CT_LEN: %llu", *clen_p]);
-            NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSString *zp = [docs stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"hpke_pt_%lu.bin", (unsigned long)time(NULL)]];
-            [[NSData dataWithBytes:m length:(NSUInteger)mlen] writeToFile:zp atomically:YES];
-            emit([NSString stringWithFormat:@"PT_SAVED: %@", zp]);
+            if (mlen > 1000) {
+                NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+                NSString *zp = [docs stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"hpke_pt_%lu.bin", (unsigned long)time(NULL)]];
+                [[NSData dataWithBytes:m length:(NSUInteger)mlen] writeToFile:zp atomically:YES];
+                emit([NSString stringWithFormat:@"PT_SAVED: %@", zp]);
+            }
         }
     } @catch (id e) { emit([NSString stringWithFormat:@"aead err: %@", e]); }
     return ret;
