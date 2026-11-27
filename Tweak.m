@@ -1,9 +1,12 @@
-// hpke_dumper v3 — safe hooks: delayed class scan, no early objc_copyClassList
+// hpke_dumper v4 — no objc_copyClassList, hook via CFNotification + NSTimer
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#include <time.h>
 
 static NSFileHandle *gFH;
 static NSString *gPath;
+static BOOL gDone = NO;
 
 static void emit(NSString *s) {
     NSLog(@"[HPKE] %@", s);
@@ -18,34 +21,43 @@ static NSString *hexOf(const void *b, NSUInteger n) {
     return h;
 }
 
-// ---- Hook: encryptData:withPublicKey:withInfo:withAad: ----
+// ---- Hook ----
 typedef void *(*EncFn)(void *, void *, void *, void *, void *, void *);
 static EncFn o_enc;
 
 static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, void *aad) {
+    // ALWAYS call original first so app doesn't break
+    void *result = o_enc(self, _cmd, data, pk, info, aad);
+
+    // Log safely — crash here won't affect app flow
     @try {
-        NSData *pkD = (__bridge NSData *)pk;
-        NSData *inD = (__bridge NSData *)data;
-        NSData *ifD = (__bridge NSData *)info;
-        NSData *aaD = (__bridge NSData *)aad;
         NSMutableString *L = [NSMutableString stringWithFormat:@"\n==== HPKE ENCRYPT ====\nClass: %s\n",
             class_getName([(__bridge id)self class])];
-        if (pkD && [pkD isKindOfClass:[NSData class]])
+
+        NSData *pkD = (__bridge NSData *)pk;
+        if (pkD && [pkD respondsToSelector:@selector(length)]) {
             [L appendFormat:@"SERVER_PK_HEX: %@\nSERVER_PK_B64: %@\nSERVER_PK_LEN: %lu\n",
                 hexOf(pkD.bytes, pkD.length), [pkD base64EncodedStringWithOptions:0], (unsigned long)pkD.length];
-        if (ifD && [ifD isKindOfClass:[NSData class]]) {
+        }
+
+        NSData *ifD = (__bridge NSData *)info;
+        if (ifD && [ifD respondsToSelector:@selector(length)]) {
             NSString *s = [[NSString alloc] initWithData:ifD encoding:NSUTF8StringEncoding];
             [L appendFormat:@"INFO_HEX: %@\nINFO_STR: %@\nINFO_LEN: %lu\n",
                 hexOf(ifD.bytes, ifD.length), s ?: @"(bin)", (unsigned long)ifD.length];
         }
-        if (aaD && [aaD isKindOfClass:[NSData class]]) {
+
+        NSData *aaD = (__bridge NSData *)aad;
+        if (aaD && [aaD respondsToSelector:@selector(length)]) {
             NSUInteger al = aaD.length;
             [L appendFormat:@"AAD_LEN: %lu\nAAD_HEX: %@\n", (unsigned long)al,
                 hexOf(aaD.bytes, al < 512 ? al : 512)];
             NSString *as = [[NSString alloc] initWithData:aaD encoding:NSUTF8StringEncoding];
             if (as) [L appendFormat:@"AAD_STR: %@\n", as];
         }
-        if (inD && [inD isKindOfClass:[NSData class]]) {
+
+        NSData *inD = (__bridge NSData *)data;
+        if (inD && [inD respondsToSelector:@selector(length)]) {
             [L appendFormat:@"PT_LEN: %lu\nPT_HEAD: %@\n", (unsigned long)inD.length,
                 hexOf(inD.bytes, inD.length < 64 ? inD.length : 64)];
             NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -54,21 +66,20 @@ static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, vo
             [inD writeToFile:zp atomically:YES];
             [L appendFormat:@"PT_SAVED: %@\n", zp];
         }
+
+        NSData *bl = (__bridge NSData *)result;
+        if (bl && [bl respondsToSelector:@selector(length)])
+            [L appendFormat:@"BLOB_LEN: %lu\nBLOB_HEAD: %@\n",
+                (unsigned long)bl.length, hexOf(bl.bytes, bl.length < 48 ? bl.length : 48)];
+
         emit(L);
-    } @catch (id e) { emit([NSString stringWithFormat:@"hook err: %@", e]); }
-
-    void *r = o_enc(self, _cmd, data, pk, info, aad);
-
-    @try {
-        NSData *bl = (__bridge NSData *)r;
-        if (bl && [bl isKindOfClass:[NSData class]])
-            emit([NSString stringWithFormat:@"BLOB_LEN: %lu\nBLOB_HEAD: %@\n",
-                (unsigned long)bl.length, hexOf(bl.bytes, bl.length < 48 ? bl.length : 48)]);
-    } @catch (__unused id e) {}
-    return r;
+    } @catch (id e) {
+        emit([NSString stringWithFormat:@"log err: %@", e]);
+    }
+    return result;
 }
 
-// ---- swizzle helper ----
+// ---- safe targeted install (no objc_copyClassList) ----
 static int swz(Class c, const char *sel, IMP imp, void *orig) {
     Method m = class_getInstanceMethod(c, sel_registerName(sel));
     if (!m) return 0;
@@ -77,32 +88,72 @@ static int swz(Class c, const char *sel, IMP imp, void *orig) {
     return 1;
 }
 
-static BOOL gDone = NO;
-
-static void tryHook(void) {
+static void tryInstall(void) {
     if (gDone) return;
-    SEL s = sel_registerName("encryptData:withPublicKey:withInfo:withAad:");
-    unsigned int n = 0;
-    Class *cls = objc_copyClassList(&n);
-    for (unsigned int i = 0; i < n; i++) {
-        if (class_getInstanceMethod(cls[i], s)) {
-            const char *name = class_getName(cls[i]);
-            int ok = swz(cls[i], "encryptData:withPublicKey:withInfo:withAad:", (IMP)my_enc, &o_enc);
-            emit([NSString stringWithFormat:@"HOOKED %s (%d)", name, ok]);
-            gDone = YES;
-            break;
+    @try {
+        // Try known class names from Ghidra (HPKE/crypto wrappers)
+        const char *candidates[] = {
+            "FBHPKEEncryptor",
+            "IGHPKEEncryptor",
+            "FBEncryptionUtils",
+            "IGEncryptionUtils",
+            "FBHPKECryptoHelper",
+            "IGHPKECryptoHelper",
+            "FBCryptoHelper",
+            "IGCryptoHelper",
+            "FBHybridEncryption",
+            "IGHybridEncryption",
+            "FBAEADEncryptor",
+            "IGAEADEncryptor",
+            "FBSealedSenderCipher",
+            "FBHPKECipher",
+            "FBDeviceIntegrity",
+            "IGDeviceIntegrity",
+            "FBPrivacyEncryption",
+            "FBASSCEncryption",
+            "IGASSCEncryption",
+            NULL
+        };
+        SEL sel = sel_registerName("encryptData:withPublicKey:withInfo:withAad:");
+        for (int i = 0; candidates[i]; i++) {
+            Class c = objc_getClass(candidates[i]);
+            if (c && class_getInstanceMethod(c, sel)) {
+                int ok = swz(c, "encryptData:withPublicKey:withInfo:withAad:", (IMP)my_enc, &o_enc);
+                emit([NSString stringWithFormat:@"HOOKED %s (%d)", candidates[i], ok]);
+                gDone = YES;
+                return;
+            }
         }
+
+        // Fallback: scan classes in SMALL SAFE batches
+        unsigned int total = 0;
+        Class *all = objc_copyClassList(&total);
+        if (!all) return;
+        for (unsigned int i = 0; i < total; i++) {
+            @try {
+                if (!class_getInstanceMethod(all[i], sel)) continue;
+                const char *name = class_getName(all[i]);
+                int ok = swz(all[i], "encryptData:withPublicKey:withInfo:withAad:", (IMP)my_enc, &o_enc);
+                emit([NSString stringWithFormat:@"HOOKED %s (%d) [scan at %u/%u]", name, ok, i, total]);
+                gDone = YES;
+                break;
+            } @catch (__unused id e) { continue; }
+        }
+        free(all);
+    } @catch (id e) {
+        emit([NSString stringWithFormat:@"install err: %@", e]);
     }
-    free(cls);
 }
 
-static void retry(int att) {
-    if (gDone) { emit(@"ALL HOOKS READY — trigger selfie IDV"); return; }
-    if (att >= 120) { emit(@"timeout — class not found"); return; }
-    tryHook();
-    if (gDone) { emit(@"ALL HOOKS READY — trigger selfie IDV"); return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-        dispatch_get_global_queue(0, 0), ^{ retry(att + 1); });
+static void retryTimer(__unused CFRunLoopTimerRef t, __unused void *ctx) {
+    static int att = 0;
+    if (gDone || att >= 60) {
+        if (!gDone) emit(@"timeout — encrypt method not found after 60 attempts");
+        return;
+    }
+    att++;
+    tryInstall();
+    if (gDone) emit(@"READY — trigger selfie IDV to capture params");
 }
 
 __attribute__((constructor))
@@ -112,9 +163,13 @@ static void init(void) {
         gPath = [docs stringByAppendingPathComponent:@"hpke_dump.txt"];
         [[NSFileManager defaultManager] createFileAtPath:gPath contents:nil attributes:nil];
         gFH = [NSFileHandle fileHandleForWritingAtPath:gPath];
-        emit(@"hpke_dumper v3 loaded");
-        // Delay class scan by 5 seconds to let IG fully load
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(0, 0), ^{ retry(0); });
+        emit(@"hpke_dumper v4 loaded");
+
+        // Use CFRunLoopTimer on main loop — fires after app is settled
+        CFRunLoopTimerRef timer = CFRunLoopTimerCreate(NULL,
+            CFAbsoluteTimeGetCurrent() + 8.0,  // first fire: 8s after load
+            2.0,                                 // repeat every 2s
+            0, 0, retryTimer, NULL);
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
     }
 }
