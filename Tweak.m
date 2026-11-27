@@ -1,10 +1,15 @@
-// hpke_dumper v11b — dlsym-only hooks, no DYLD_INTERPOSE, no fishhook
-// Find libsodium functions via dlsym, patch via manual GOT replacement
-// If symbols are statically linked, use function-pointer swizzle at call time
+// hpke_dumper v12 — dlsym found symbols! Now hook via swizzle on the
+// FRAMEWORK that owns them (not main binary).
+// v11b: dlsym works, GOT patch on main binary crashes (chained fixups)
+// v12: find which image owns the symbol, patch ITS GOT instead
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <stdint.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <string.h>
 
 static NSFileHandle *gFH;
 static NSString *gPath;
@@ -22,7 +27,6 @@ static NSString *hexOf(const void *b, size_t n) {
     return h;
 }
 
-// ---- Function pointer types ----
 typedef int (*aead_fn)(unsigned char *, unsigned long long *,
     const unsigned char *, unsigned long long,
     const unsigned char *, unsigned long long,
@@ -34,7 +38,6 @@ static aead_fn orig_aead = NULL;
 static scalarmult_fn orig_mult = NULL;
 static scalarmult_base_fn orig_base = NULL;
 
-// ---- Hooks ----
 static int my_aead(unsigned char *c, unsigned long long *clen_p,
     const unsigned char *m, unsigned long long mlen,
     const unsigned char *ad, unsigned long long adlen,
@@ -90,74 +93,89 @@ static int my_base(unsigned char *q, const unsigned char *n) {
     return ret;
 }
 
-// ---- Manual GOT patch for ONE symbol in ONE image ----
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <string.h>
-#include <sys/mman.h>
+// ---- Find which image EXPORTS a symbol, then patch GOT of images that IMPORT it ----
+static void patchCallers(const char *sym_name, void *replacement, void **out_original) {
+    // Use dladdr to find which image owns the symbol
+    void *sym = dlsym(RTLD_DEFAULT, sym_name);
+    if (!sym) return;
 
-static void patch_got_for_symbol(const char *sym_name, void *replacement, void **out_original) {
-    // Walk ONLY the main binary (image 0) — no iteration over all images
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!mh) return;
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    Dl_info info;
+    if (dladdr(sym, &info) == 0) return;
+    emit([NSString stringWithFormat:@"  %s lives in: %s", sym_name, info.dli_fname]);
 
-    struct symtab_command *symtab_cmd = NULL;
-    struct dysymtab_command *dysymtab_cmd = NULL;
-    const struct segment_command_64 *linkedit_seg = NULL;
-    const struct segment_command_64 *data_seg = NULL;
-    const struct segment_command_64 *data_const_seg = NULL;
+    // Now scan a FEW small framework images (not main binary!) for GOT entries
+    // The HPKE caller is likely a small framework, not the 407MB main binary
+    uint32_t imgCount = _dyld_image_count();
+    int patched = 0;
 
-    const uint8_t *ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)ptr;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
-            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit_seg = seg;
-            else if (strcmp(seg->segname, "__DATA") == 0) data_seg = seg;
-            else if (strcmp(seg->segname, "__DATA_CONST") == 0) data_const_seg = seg;
-        } else if (lc->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command *)ptr;
-        } else if (lc->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command *)ptr;
-        }
-        ptr += lc->cmdsize;
-    }
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit_seg) return;
+    for (uint32_t img = 1; img < imgCount && img < 50 && patched < 3; img++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(img);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(img);
 
-    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
-    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
-    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+        struct symtab_command *symtab_cmd = NULL;
+        struct dysymtab_command *dysymtab_cmd = NULL;
+        const struct segment_command_64 *linkedit_seg = NULL;
 
-    // Patch lazy + non-lazy symbol pointers in __DATA and __DATA_CONST
-    const struct segment_command_64 *segs[] = {data_seg, data_const_seg, NULL};
-    for (int si = 0; segs[si]; si++) {
-        const struct section_64 *sections = (const struct section_64 *)((uint8_t *)segs[si] + sizeof(struct segment_command_64));
-        for (uint32_t j = 0; j < segs[si]->nsects; j++) {
-            uint32_t type = sections[j].flags & SECTION_TYPE;
-            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-
-            uint32_t *indices = indirect_symtab + sections[j].reserved1;
-            void **bindings = (void **)(slide + sections[j].addr);
-            uint32_t count = (uint32_t)(sections[j].size / sizeof(void *));
-
-            for (uint32_t k = 0; k < count; k++) {
-                uint32_t idx = indices[k];
-                if (idx == 0x40000000 || idx == 0x80000000 || idx == 0xC0000000) continue;
-                uint32_t strx = symtab[idx].n_un.n_strx;
-                const char *name = strtab + strx;
-                // Symbol names have leading underscore
-                if (name[0] == '_' && strcmp(name + 1, sym_name) == 0) {
-                    if (out_original && bindings[k] != replacement)
-                        *out_original = bindings[k];
-                    bindings[k] = replacement;
-                    return;
-                }
+        const uint8_t *ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < mh->ncmds; i++) {
+            const struct load_command *lc = (const struct load_command *)ptr;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit_seg = seg;
+            } else if (lc->cmd == LC_SYMTAB) {
+                symtab_cmd = (struct symtab_command *)ptr;
+            } else if (lc->cmd == LC_DYSYMTAB) {
+                dysymtab_cmd = (struct dysymtab_command *)ptr;
             }
+            ptr += lc->cmdsize;
         }
+        if (!symtab_cmd || !dysymtab_cmd || !linkedit_seg) continue;
+
+        @try {
+            uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+            struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+            char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+            uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+            ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
+            for (uint32_t i = 0; i < mh->ncmds; i++) {
+                const struct load_command *lc = (const struct load_command *)ptr;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+                    if (strcmp(seg->segname, "__DATA") != 0 && strcmp(seg->segname, "__DATA_CONST") != 0) {
+                        ptr += lc->cmdsize; continue;
+                    }
+                    const struct section_64 *sections = (const struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
+                    for (uint32_t j = 0; j < seg->nsects; j++) {
+                        uint32_t type = sections[j].flags & SECTION_TYPE;
+                        if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                        uint32_t *indices = indirect_symtab + sections[j].reserved1;
+                        void **bindings = (void **)(slide + sections[j].addr);
+                        uint32_t count = (uint32_t)(sections[j].size / sizeof(void *));
+                        for (uint32_t k = 0; k < count; k++) {
+                            uint32_t idx = indices[k];
+                            if (idx == 0x40000000 || idx == 0x80000000 || idx == 0xC0000000) continue;
+                            if (idx >= symtab_cmd->nsyms) continue;
+                            uint32_t strx = symtab[idx].n_un.n_strx;
+                            if (strx >= symtab_cmd->strsize) continue;
+                            const char *name = strtab + strx;
+                            if (name[0] == '_' && strcmp(name + 1, sym_name) == 0) {
+                                if (out_original && bindings[k] != replacement)
+                                    *out_original = bindings[k];
+                                bindings[k] = replacement;
+                                patched++;
+                                const char *imgName = _dyld_get_image_name(img);
+                                emit([NSString stringWithFormat:@"  patched img=%u %s", img, imgName ?: "?"]);
+                            }
+                        }
+                    }
+                }
+                ptr += lc->cmdsize;
+            }
+        } @catch (__unused id e) { continue; }
     }
+    if (patched == 0) emit([NSString stringWithFormat:@"  no GOT entries found for %s in first 50 images", sym_name]);
 }
 
 __attribute__((constructor))
@@ -167,31 +185,22 @@ static void init(void) {
         gPath = [docs stringByAppendingPathComponent:@"hpke_dump.txt"];
         [[NSFileManager defaultManager] createFileAtPath:gPath contents:nil attributes:nil];
         gFH = [NSFileHandle fileHandleForWritingAtPath:gPath];
-        emit(@"hpke_dumper v11b loaded");
+        emit(@"hpke_dumper v12 loaded");
 
-        // Try dlsym first (works if symbols are dynamically linked)
         orig_aead = (aead_fn)dlsym(RTLD_DEFAULT, "crypto_aead_chacha20poly1305_ietf_encrypt");
         orig_mult = (scalarmult_fn)dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519");
         orig_base = (scalarmult_base_fn)dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519_base");
 
-        emit([NSString stringWithFormat:@"dlsym: aead=%p mult=%p base=%p",
-            orig_aead, orig_mult, orig_base]);
+        emit([NSString stringWithFormat:@"dlsym: aead=%p mult=%p base=%p", orig_aead, orig_mult, orig_base]);
 
         if (orig_aead) {
-            // Symbols are dynamic — patch GOT of main binary only
-            emit(@"symbols found via dlsym — patching main binary GOT");
-            patch_got_for_symbol("crypto_aead_chacha20poly1305_ietf_encrypt",
-                (void *)my_aead, (void **)&orig_aead);
-            patch_got_for_symbol("crypto_scalarmult_curve25519",
-                (void *)my_mult, (void **)&orig_mult);
-            patch_got_for_symbol("crypto_scalarmult_curve25519_base",
-                (void *)my_base, (void **)&orig_base);
-            emit([NSString stringWithFormat:@"after patch: aead=%p mult=%p base=%p",
-                orig_aead, orig_mult, orig_base]);
+            emit(@"patching framework GOTs (skipping main binary)...");
+            patchCallers("crypto_aead_chacha20poly1305_ietf_encrypt", (void *)my_aead, (void **)&orig_aead);
+            patchCallers("crypto_scalarmult_curve25519", (void *)my_mult, (void **)&orig_mult);
+            patchCallers("crypto_scalarmult_curve25519_base", (void *)my_base, (void **)&orig_base);
             emit(@"READY — trigger selfie IDV");
         } else {
-            emit(@"symbols NOT found via dlsym — may be statically linked");
-            emit(@"try alternative: hook ObjC selector via delayed scan");
+            emit(@"symbols NOT found — statically linked");
         }
     }
 }
