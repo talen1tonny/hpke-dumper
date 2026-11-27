@@ -1,15 +1,14 @@
-// hpke_dumper v12 — dlsym found symbols! Now hook via swizzle on the
-// FRAMEWORK that owns them (not main binary).
-// v11b: dlsym works, GOT patch on main binary crashes (chained fixups)
-// v12: find which image owns the symbol, patch ITS GOT instead
+// hpke_dumper v13 — inline hook via vm_protect + ARM64 trampoline
+// dlsym finds the function, we patch its prologue to jump to our hook
+// Requires JIT/CS_DEBUGGED (TrollStore usually provides this)
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <stdint.h>
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
+#include <mach/mach.h>
 #include <string.h>
+#include <pthread.h>
+#include <libkern/OSCacheControl.h>
 
 static NSFileHandle *gFH;
 static NSString *gPath;
@@ -31,18 +30,17 @@ typedef int (*aead_fn)(unsigned char *, unsigned long long *,
     const unsigned char *, unsigned long long,
     const unsigned char *, unsigned long long,
     const unsigned char *, const unsigned char *, const unsigned char *);
-typedef int (*scalarmult_fn)(unsigned char *, const unsigned char *, const unsigned char *);
-typedef int (*scalarmult_base_fn)(unsigned char *, const unsigned char *);
 
-static aead_fn orig_aead = NULL;
-static scalarmult_fn orig_mult = NULL;
-static scalarmult_base_fn orig_base = NULL;
+static aead_fn orig_aead_trampoline = NULL;
 
+// ---- Our hook ----
 static int my_aead(unsigned char *c, unsigned long long *clen_p,
     const unsigned char *m, unsigned long long mlen,
     const unsigned char *ad, unsigned long long adlen,
     const unsigned char *nsec, const unsigned char *npub, const unsigned char *k) {
-    int ret = orig_aead(c, clen_p, m, mlen, ad, adlen, nsec, npub, k);
+
+    int ret = orig_aead_trampoline(c, clen_p, m, mlen, ad, adlen, nsec, npub, k);
+
     @try {
         if (mlen > 1000) {
             emit(@"==== AEAD ENCRYPT ====");
@@ -68,114 +66,87 @@ static int my_aead(unsigned char *c, unsigned long long *clen_p,
     return ret;
 }
 
-static int my_mult(unsigned char *q, const unsigned char *n, const unsigned char *p) {
-    int ret = orig_mult(q, n, p);
-    static int cc = 0; cc++;
-    if (cc <= 5) {
-        @try {
-            emit(@"==== X25519 DH ====");
-            if (p) emit([NSString stringWithFormat:@"PEER_PK: %@", hexOf(p, 32)]);
-            if (q) emit([NSString stringWithFormat:@"SHARED: %@", hexOf(q, 32)]);
-        } @catch (id e) {}
+// ---- Trampoline: saved original bytes + jump back ----
+// We need RWX memory for the trampoline that executes the original prologue
+// then jumps back to original+16
+static uint8_t trampoline_buf[64] __attribute__((aligned(4096)));
+
+static int inline_hook(void *target, void *replacement, void **out_trampoline) {
+    uintptr_t target_addr = (uintptr_t)target;
+    uintptr_t replacement_addr = (uintptr_t)replacement;
+    vm_address_t page = target_addr & ~(vm_address_t)(0x3FFF); // 16K pages on iOS
+    vm_size_t page_size = 0x4000;
+
+    // Step 1: Try to make target page writable
+    kern_return_t kr;
+
+    // Try MAP_JIT approach first (TrollStore)
+    kr = vm_protect(mach_task_self(), page, page_size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        // Try without COPY
+        kr = vm_protect(mach_task_self(), page, page_size, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE);
     }
-    return ret;
-}
-
-static int my_base(unsigned char *q, const unsigned char *n) {
-    int ret = orig_base(q, n);
-    static int cc = 0; cc++;
-    if (cc <= 5) {
-        @try {
-            emit(@"==== X25519 KEYGEN ====");
-            if (q) emit([NSString stringWithFormat:@"EPH_PK: %@", hexOf(q, 32)]);
-        } @catch (id e) {}
+    if (kr != KERN_SUCCESS) {
+        emit([NSString stringWithFormat:@"vm_protect(RW) FAILED: %d (%s)", kr, mach_error_string(kr)]);
+        return -1;
     }
-    return ret;
-}
+    emit(@"vm_protect(RW) OK");
 
-// ---- Find which image EXPORTS a symbol, then patch GOT of images that IMPORT it ----
-static void patchCallers(const char *sym_name, void *replacement, void **out_original) {
-    // Use dladdr to find which image owns the symbol
-    void *sym = dlsym(RTLD_DEFAULT, sym_name);
-    if (!sym) return;
+    // Step 2: Save original 16 bytes
+    uint8_t saved[16];
+    memcpy(saved, target, 16);
+    emit([NSString stringWithFormat:@"original prologue: %@", hexOf(saved, 16)]);
 
-    Dl_info info;
-    if (dladdr(sym, &info) == 0) return;
-    emit([NSString stringWithFormat:@"  %s lives in: %s", sym_name, info.dli_fname]);
-
-    // Now scan a FEW small framework images (not main binary!) for GOT entries
-    // The HPKE caller is likely a small framework, not the 407MB main binary
-    uint32_t imgCount = _dyld_image_count();
-    int patched = 0;
-
-    for (uint32_t img = 1; img < imgCount && patched < 3; img++) {
-        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(img);
-        if (!mh || mh->magic != MH_MAGIC_64) continue;
-        intptr_t slide = _dyld_get_image_vmaddr_slide(img);
-
-        struct symtab_command *symtab_cmd = NULL;
-        struct dysymtab_command *dysymtab_cmd = NULL;
-        const struct segment_command_64 *linkedit_seg = NULL;
-
-        const uint8_t *ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
-        for (uint32_t i = 0; i < mh->ncmds; i++) {
-            const struct load_command *lc = (const struct load_command *)ptr;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
-                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit_seg = seg;
-            } else if (lc->cmd == LC_SYMTAB) {
-                symtab_cmd = (struct symtab_command *)ptr;
-            } else if (lc->cmd == LC_DYSYMTAB) {
-                dysymtab_cmd = (struct dysymtab_command *)ptr;
-            }
-            ptr += lc->cmdsize;
-        }
-        if (!symtab_cmd || !dysymtab_cmd || !linkedit_seg) continue;
-
-        @try {
-            uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
-            struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
-            char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
-            uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
-
-            ptr = (const uint8_t *)mh + sizeof(struct mach_header_64);
-            for (uint32_t i = 0; i < mh->ncmds; i++) {
-                const struct load_command *lc = (const struct load_command *)ptr;
-                if (lc->cmd == LC_SEGMENT_64) {
-                    const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
-                    if (strcmp(seg->segname, "__DATA") != 0 && strcmp(seg->segname, "__DATA_CONST") != 0) {
-                        ptr += lc->cmdsize; continue;
-                    }
-                    const struct section_64 *sections = (const struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
-                    for (uint32_t j = 0; j < seg->nsects; j++) {
-                        uint32_t type = sections[j].flags & SECTION_TYPE;
-                        if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-                        uint32_t *indices = indirect_symtab + sections[j].reserved1;
-                        void **bindings = (void **)(slide + sections[j].addr);
-                        uint32_t count = (uint32_t)(sections[j].size / sizeof(void *));
-                        for (uint32_t k = 0; k < count; k++) {
-                            uint32_t idx = indices[k];
-                            if (idx == 0x40000000 || idx == 0x80000000 || idx == 0xC0000000) continue;
-                            if (idx >= symtab_cmd->nsyms) continue;
-                            uint32_t strx = symtab[idx].n_un.n_strx;
-                            if (strx >= symtab_cmd->strsize) continue;
-                            const char *name = strtab + strx;
-                            if (name[0] == '_' && strcmp(name + 1, sym_name) == 0) {
-                                if (out_original && bindings[k] != replacement)
-                                    *out_original = bindings[k];
-                                bindings[k] = replacement;
-                                patched++;
-                                const char *imgName = _dyld_get_image_name(img);
-                                emit([NSString stringWithFormat:@"  patched img=%u %s", img, imgName ?: "?"]);
-                            }
-                        }
-                    }
-                }
-                ptr += lc->cmdsize;
-            }
-        } @catch (__unused id e) { continue; }
+    // Step 3: Build trampoline (execute saved bytes + jump to original+16)
+    // Make trampoline buffer executable
+    vm_address_t tramp_page = (vm_address_t)trampoline_buf & ~(vm_address_t)(0x3FFF);
+    kr = vm_protect(mach_task_self(), tramp_page, page_size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        emit([NSString stringWithFormat:@"trampoline vm_protect(RW) FAILED: %d", kr]);
+        return -2;
     }
-    if (patched == 0) emit([NSString stringWithFormat:@"  no GOT entries found for %s in %u images", sym_name, imgCount - 1]);
+
+    // Copy saved instructions
+    memcpy(trampoline_buf, saved, 16);
+    // Add: LDR X16, [PC, #8]; BR X16; <addr>
+    uint32_t ldr_x16 = 0x58000050;  // LDR X16, PC+8
+    uint32_t br_x16  = 0xD61F0200;  // BR X16
+    memcpy(trampoline_buf + 16, &ldr_x16, 4);
+    memcpy(trampoline_buf + 20, &br_x16, 4);
+    uintptr_t resume_addr = target_addr + 16;
+    memcpy(trampoline_buf + 24, &resume_addr, 8);
+
+    // Make trampoline executable
+    kr = vm_protect(mach_task_self(), tramp_page, page_size, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        emit([NSString stringWithFormat:@"trampoline vm_protect(RX) FAILED: %d", kr]);
+        return -3;
+    }
+    sys_icache_invalidate(trampoline_buf, 32);
+    *out_trampoline = trampoline_buf;
+
+    // Step 4: Write branch to our hook at target
+    // LDR X16, [PC, #8]; BR X16; <replacement_addr>
+    uint32_t hook_code[4];
+    hook_code[0] = 0x58000050;  // LDR X16, PC+8
+    hook_code[1] = 0xD61F0200;  // BR X16
+    memcpy(&hook_code[2], &replacement_addr, 8);
+    memcpy(target, hook_code, 16);
+
+    // Step 5: Restore target page to RX
+    kr = vm_protect(mach_task_self(), page, page_size, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        emit([NSString stringWithFormat:@"WARNING: restore vm_protect(RX) FAILED: %d", kr]);
+    }
+    sys_icache_invalidate(target, 16);
+
+    emit(@"inline hook installed OK");
+    return 0;
 }
 
 __attribute__((constructor))
@@ -185,22 +156,25 @@ static void init(void) {
         gPath = [docs stringByAppendingPathComponent:@"hpke_dump.txt"];
         [[NSFileManager defaultManager] createFileAtPath:gPath contents:nil attributes:nil];
         gFH = [NSFileHandle fileHandleForWritingAtPath:gPath];
-        emit(@"hpke_dumper v12 loaded");
+        emit(@"hpke_dumper v13 loaded (inline hook)");
 
-        orig_aead = (aead_fn)dlsym(RTLD_DEFAULT, "crypto_aead_chacha20poly1305_ietf_encrypt");
-        orig_mult = (scalarmult_fn)dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519");
-        orig_base = (scalarmult_base_fn)dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519_base");
+        void *aead_ptr = dlsym(RTLD_DEFAULT, "crypto_aead_chacha20poly1305_ietf_encrypt");
+        emit([NSString stringWithFormat:@"dlsym aead: %p", aead_ptr]);
 
-        emit([NSString stringWithFormat:@"dlsym: aead=%p mult=%p base=%p", orig_aead, orig_mult, orig_base]);
+        if (!aead_ptr) {
+            emit(@"symbol not found — cannot hook");
+            return;
+        }
 
-        if (orig_aead) {
-            emit(@"patching framework GOTs (skipping main binary)...");
-            patchCallers("crypto_aead_chacha20poly1305_ietf_encrypt", (void *)my_aead, (void **)&orig_aead);
-            patchCallers("crypto_scalarmult_curve25519", (void *)my_mult, (void **)&orig_mult);
-            patchCallers("crypto_scalarmult_curve25519_base", (void *)my_base, (void **)&orig_base);
-            emit(@"READY — trigger selfie IDV");
+        void *tramp = NULL;
+        int r = inline_hook(aead_ptr, (void *)my_aead, &tramp);
+        if (r == 0) {
+            orig_aead_trampoline = (aead_fn)tramp;
+            emit(@"READY — AEAD hooked. Trigger selfie IDV.");
         } else {
-            emit(@"symbols NOT found — statically linked");
+            emit([NSString stringWithFormat:@"inline hook failed: %d", r]);
+            emit(@"This device may not support JIT/code patching");
+            emit(@"Try on the Dopamine JB device instead");
         }
     }
 }
