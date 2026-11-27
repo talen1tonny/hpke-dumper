@@ -108,7 +108,7 @@ static void patchCallers(const char *sym_name, void *replacement, void **out_ori
     uint32_t imgCount = _dyld_image_count();
     int patched = 0;
 
-    for (uint32_t img = 1; img < imgCount && img < 50 && patched < 3; img++) {
+    for (uint32_t img = 1; img < imgCount && patched < 3; img++) {
         const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(img);
         if (!mh || mh->magic != MH_MAGIC_64) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(img);
@@ -175,7 +175,7 @@ static void patchCallers(const char *sym_name, void *replacement, void **out_ori
             }
         } @catch (__unused id e) { continue; }
     }
-    if (patched == 0) emit([NSString stringWithFormat:@"  no GOT entries found for %s in first 50 images", sym_name]);
+    if (patched == 0) emit([NSString stringWithFormat:@"  no GOT entries found for %s in %u images", sym_name, imgCount - 1]);
 }
 
 __attribute__((constructor))
