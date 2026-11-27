@@ -2,9 +2,9 @@ workflows:
   hpke-build:
     name: HPKE Dumper Build
     instance_type: mac_mini_m2
-    max_build_duration: 15
+    max_build_duration: 10
     scripts:
-      - name: Install deps + Theos
+      - name: Install deps
         script: |
           set -e
           brew install ldid 2>/dev/null || true
@@ -14,24 +14,6 @@ workflows:
             rm -rf "$THEOS/sdks"
             git clone --quiet --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
           fi
-      - name: Build Dobby (static, arm64+arm64e)
-        script: |
-          set -e
-          git clone --quiet --depth 1 https://github.com/jmpews/Dobby.git dobby-src
-          cmake -S dobby-src -B dobby-build -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
-            -DDOBBY_DEBUG=OFF
-          cmake --build dobby-build --config Release --target dobby_static
-          libtool -static -o libdobby.a $(find dobby-build -name '*.a')
-          cp "$(find dobby-src -name 'dobby.h' | head -1)" ./dobby.h
-          echo "=== Dobby ===" && ls -la libdobby.a dobby.h && lipo -info libdobby.a
       - name: Build dylib
         script: |
           set -e
