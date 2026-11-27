@@ -1,14 +1,11 @@
-// hpke_dumper v8 — discovery: find class name that owns encryptData:
-// v7 confirmed selector in __TEXT,__objc_methname (singular!)
-// Now: find crypto class names + try each via objc_getClass (safe)
-// Each finding = separate NSLog (no syslog truncation)
+// hpke_dumper v9 — class_getName scan (safe) + objc_getClass hook
+// v8 found: selectors confirmed, __objc_classname section MISSING
+// v3-v5 crashed from class_getInstanceMethod on unrealized classes
+// v9: class_getName ONLY from objc_copyClassList (no method resolution)
+//     then objc_getClass(name) + class_getInstanceMethod (safe on realized)
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <time.h>
-#include <mach-o/dyld.h>
-#include <mach-o/getsect.h>
-#include <mach-o/loader.h>
-#include <string.h>
 
 static NSFileHandle *gFH;
 static NSString *gPath;
@@ -33,7 +30,7 @@ static EncFn o_enc;
 static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, void *aad) {
     void *result = o_enc(self, _cmd, data, pk, info, aad);
     @try {
-        emit([NSString stringWithFormat:@"==== HPKE ENCRYPT ===="]);
+        emit(@"==== HPKE ENCRYPT ====");
         emit([NSString stringWithFormat:@"Class: %s  SEL: %s",
             class_getName([(__bridge id)self class]), sel_getName(_cmd)]);
         NSData *pkD = (__bridge NSData *)pk;
@@ -47,13 +44,11 @@ static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, vo
             NSString *s = [[NSString alloc] initWithData:ifD encoding:NSUTF8StringEncoding];
             emit([NSString stringWithFormat:@"INFO_HEX: %@", hexOf(ifD.bytes, ifD.length)]);
             emit([NSString stringWithFormat:@"INFO_STR: %@", s ?: @"(bin)"]);
-            emit([NSString stringWithFormat:@"INFO_LEN: %lu", (unsigned long)ifD.length]);
         }
         NSData *aaD = (__bridge NSData *)aad;
         if (aaD && [aaD respondsToSelector:@selector(length)]) {
-            NSUInteger al = aaD.length;
-            emit([NSString stringWithFormat:@"AAD_LEN: %lu", (unsigned long)al]);
-            emit([NSString stringWithFormat:@"AAD_HEX: %@", hexOf(aaD.bytes, al < 512 ? al : 512)]);
+            emit([NSString stringWithFormat:@"AAD_LEN: %lu", (unsigned long)aaD.length]);
+            emit([NSString stringWithFormat:@"AAD_HEX: %@", hexOf(aaD.bytes, aaD.length < 512 ? aaD.length : 512)]);
             NSString *as = [[NSString alloc] initWithData:aaD encoding:NSUTF8StringEncoding];
             if (as) emit([NSString stringWithFormat:@"AAD_STR: %@", as]);
         }
@@ -72,23 +67,19 @@ static void *my_enc(void *self, void *_cmd, void *data, void *pk, void *info, vo
             emit([NSString stringWithFormat:@"BLOB_LEN: %lu", (unsigned long)bl.length]);
             emit([NSString stringWithFormat:@"BLOB_HEAD: %@", hexOf(bl.bytes, bl.length < 48 ? bl.length : 48)]);
         }
-    } @catch (id e) {
-        emit([NSString stringWithFormat:@"log err: %@", e]);
-    }
+    } @catch (id e) { emit([NSString stringWithFormat:@"log err: %@", e]); }
     return result;
 }
 
-// ---- All selectors ----
 static const char *kSels[] = {
     "encryptData:withPublicKey:withInfo:withAad:",
-    "encryptData:withPublicKey:withInfo:withAAD:",
     "encryptDataPadded:withPublicKey:withInfo:withAad:",
     "encryptStringPadded:withPublicKey:withInfo:withAad:",
+    "encryptString:withPublicKey:withInfo:withAad:",
     NULL
 };
 
-// ---- Try hook a class by name ----
-static BOOL tryHookClass(const char *name) {
+static BOOL tryHookByName(const char *name) {
     Class c = objc_getClass(name);
     if (!c) return NO;
     for (int s = 0; kSels[s]; s++) {
@@ -105,115 +96,72 @@ static BOOL tryHookClass(const char *name) {
     return NO;
 }
 
-// ---- Discovery: find crypto class names from __objc_classname in main binary ----
-static void discoverAndHook(void) {
-    emit(@"=== DISCOVERY v8 START ===");
+// ---- PHASE 1: safe class_getName scan (NO class_getInstanceMethod) ----
+static void nameOnlyScan(void) {
+    emit(@"=== NAME SCAN START ===");
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) { emit(@"objc_copyClassList returned NULL"); return; }
+    emit([NSString stringWithFormat:@"total classes: %u", count]);
 
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!mh) { emit(@"no main image"); return; }
+    // STEP 1: collect all names (class_getName is safe — no realization)
+    NSMutableArray *candidates = [NSMutableArray new];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = NULL;
+        @try { name = class_getName(classes[i]); } @catch (__unused id e) { continue; }
+        if (!name) continue;
 
-    // Search for class names in multiple possible section names
-    const char *sectNames[] = {"__objc_classname", "__objc_classnames", NULL};
-    const char *segNames[] = {"__TEXT", "__DATA", "__DATA_CONST", NULL};
+        // Filter: anything with encrypt/HPKE/E2EE/seal/conv3p/authenticity/enrichment
+        if (strstr(name, "ncrypt") || strstr(name, "HPKE") || strstr(name, "hpke") ||
+            strstr(name, "E2EE") || strstr(name, "e2ee") || strstr(name, "Seal") ||
+            strstr(name, "3PConv") || strstr(name, "Conv3P") || strstr(name, "3P_CONV") ||
+            strstr(name, "uthenticity") || strstr(name, "nrichment") ||
+            strstr(name, "Cipher") || strstr(name, "PublicKey") || strstr(name, "Hybrid") ||
+            strstr(name, "AEAD") || strstr(name, "Signal") || strstr(name, "Crypto") ||
+            strstr(name, "IDV") || strstr(name, "idv")) {
+            NSString *ns = [NSString stringWithUTF8String:name];
+            [candidates addObject:ns];
+            emit([NSString stringWithFormat:@"NAME: %s", name]);
+        }
+    }
+    free(classes);
+    emit([NSString stringWithFormat:@"filtered: %lu candidates", (unsigned long)candidates.count]);
 
-    // Keywords for filtering
-    const char *kw[] = {
-        "ncrypt", "HPKE", "hpke", "Seal", "Cipher", "PublicKey",
-        "Hybrid", "AEAD", "aead", "EE", "E2EE", "e2ee",
-        "Enrichment", "enrichment", "Authenticity", "authenticity",
-        "IDV", "Selfie", "Recovery", "Signal", "Crypto", "crypto",
-        "3PConv", "Conv3P", "CONV", NULL
-    };
-
-    int totalFound = 0;
-
-    for (int sg = 0; segNames[sg]; sg++) {
-        for (int sc = 0; sectNames[sc]; sc++) {
-            unsigned long sz = 0;
-            const uint8_t *data = getsectiondata(mh, segNames[sg], sectNames[sc], &sz);
-            if (!data || sz == 0) continue;
-
-            emit([NSString stringWithFormat:@"SECT %s,%s = %lu bytes", segNames[sg], sectNames[sc], sz]);
-
-            // Walk null-terminated strings
-            unsigned long pos = 0;
-            while (pos < sz) {
-                const char *name = (const char *)(data + pos);
-                size_t nLen = strnlen(name, sz - pos);
-                if (nLen == 0) { pos++; continue; }
-
-                // Check keywords
-                for (int k = 0; kw[k]; k++) {
-                    if (strstr(name, kw[k])) {
-                        emit([NSString stringWithFormat:@"CLASS_HIT: %s", name]);
-                        totalFound++;
-
-                        // Try to hook it
-                        if (!gHooked) {
-                            BOOL ok = tryHookClass(name);
-                            if (ok) emit([NSString stringWithFormat:@"HOOK SUCCESS via discovery: %s", name]);
-                        }
-                        break;
-                    }
-                }
-                pos += nLen + 1;
+    // STEP 2: for each candidate, use objc_getClass (safe realization) + method check
+    for (NSString *ns in candidates) {
+        if (gHooked) break;
+        const char *name = ns.UTF8String;
+        @try {
+            if (tryHookByName(name)) {
+                emit([NSString stringWithFormat:@"HOOK SUCCESS: %s", name]);
+                break;
             }
+        } @catch (__unused id e) {
+            emit([NSString stringWithFormat:@"hook attempt err on %s", name]);
         }
     }
 
-    // Also walk __objc_methname to show full selector strings around our hit
-    for (int sg = 0; segNames[sg]; sg++) {
-        const char *mSects[] = {"__objc_methname", "__objc_methnames", NULL};
-        for (int sc = 0; mSects[sc]; sc++) {
-            unsigned long sz = 0;
-            const uint8_t *data = getsectiondata(mh, segNames[sg], mSects[sc], &sz);
-            if (!data || sz == 0) continue;
-            emit([NSString stringWithFormat:@"METHSECT %s,%s = %lu bytes", segNames[sg], mSects[sc], sz]);
-
-            // Find our exact selectors
-            unsigned long pos = 0;
-            while (pos < sz) {
-                const char *s = (const char *)(data + pos);
-                size_t sLen = strnlen(s, sz - pos);
-                if (sLen == 0) { pos++; continue; }
-                if (strstr(s, "encryptData") || strstr(s, "encryptString") || strstr(s, "uploadE2EE")) {
-                    emit([NSString stringWithFormat:@"SEL_FULL: %s", s]);
-                }
-                pos += sLen + 1;
-            }
-        }
-    }
-
-    emit([NSString stringWithFormat:@"=== DISCOVERY v8 DONE: %d crypto classes found, hooked=%d ===",
-        totalFound, gHooked ? 1 : 0]);
+    emit([NSString stringWithFormat:@"=== NAME SCAN DONE: hooked=%d ===", gHooked ? 1 : 0]);
 }
 
 // ---- Known class names ----
 static const char *kClasses[] = {
     "FBHPKEEncryptor", "IGHPKEEncryptor",
     "FBEncryptionUtils", "IGEncryptionUtils",
-    "FBHPKECryptoHelper", "IGHPKECryptoHelper",
     "FBCryptoHelper", "IGCryptoHelper",
     "FBHybridEncryption", "IGHybridEncryption",
-    "FBAEADEncryptor", "IGAEADEncryptor",
     "FBEndToEndEncryption", "IGEndToEndEncryption",
-    "FBCryptoService", "IGCryptoService",
-    "FBHybridPublicKeyEncryption", "IGHybridPublicKeyEncryption",
     "FBEEEncryptor", "IGEEEncryptor",
     "FBEnrichmentEncryptor", "IGEnrichmentEncryptor",
-    "FBContentEncryption", "IGContentEncryption",
     "FBAuthenticityEncryption", "IGAuthenticityEncryption",
     "AuthenticityOnDeviceSignalsTracker",
-    "IGAuthenticityOnDeviceSignalsTracker",
-    "FBAuthenticityOnDeviceSignalsTracker",
-    "FBSealedBox", "IGSealedBox",
-    "FBPublicKeyEncryption", "IGPublicKeyEncryption",
+    "FBContentEncryption", "IGContentEncryption",
     NULL
 };
 
 static BOOL tryKnown(void) {
     for (int c = 0; kClasses[c]; c++) {
-        if (tryHookClass(kClasses[c])) return YES;
+        if (tryHookByName(kClasses[c])) return YES;
     }
     return NO;
 }
@@ -221,8 +169,8 @@ static BOOL tryKnown(void) {
 static void retryInstall(int attempt) {
     if (gHooked) { emit(@"READY — trigger selfie IDV"); return; }
     if (attempt >= 20) {
-        emit(@"known exhausted → discovery");
-        discoverAndHook();
+        emit(@"known exhausted → name scan");
+        nameOnlyScan();
         return;
     }
     if (tryKnown()) { emit(@"READY — trigger selfie IDV"); return; }
@@ -237,7 +185,7 @@ static void init(void) {
         gPath = [docs stringByAppendingPathComponent:@"hpke_dump.txt"];
         [[NSFileManager defaultManager] createFileAtPath:gPath contents:nil attributes:nil];
         gFH = [NSFileHandle fileHandleForWritingAtPath:gPath];
-        emit(@"hpke_dumper v8 loaded");
+        emit(@"hpke_dumper v9 loaded");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ retryInstall(0); });
     }
