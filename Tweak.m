@@ -188,23 +188,10 @@ static void init(void) {
             }
         }
 
-        // C hook 2: scalarmult (DH — server pubkey)
+        // DH/KEYGEN: log addresses only (inline hook crashes — PC-relative instrs in prologue)
         void *mult_ptr = dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519");
-        if (mult_ptr) {
-            void *tp = alloc_trampoline_page();
-            if (tp && do_inline_hook(mult_ptr, (void *)my_mult, tp, (void **)&orig_mult) == 0) {
-                emit(@"DH hook OK"); hooked++;
-            }
-        }
-
-        // C hook 3: scalarmult_base (eph keygen)
         void *base_ptr = dlsym(RTLD_DEFAULT, "crypto_scalarmult_curve25519_base");
-        if (base_ptr) {
-            void *tp = alloc_trampoline_page();
-            if (tp && do_inline_hook(base_ptr, (void *)my_base, tp, (void **)&orig_base) == 0) {
-                emit(@"KEYGEN hook OK"); hooked++;
-            }
-        }
+        emit([NSString stringWithFormat:@"DH=%p KEYGEN=%p (not hooked — crash-prone prologue)", mult_ptr, base_ptr]);
 
         emit([NSString stringWithFormat:@"C hooks: %d/3", hooked]);
 
