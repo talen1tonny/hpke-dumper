@@ -165,16 +165,7 @@ static void installObjcHooks(void) {
         emit(@"uploadTask method not found");
     }
 
-    // Also hook dataTaskWithRequest:completionHandler: (some uploads use this)
-    SEL sel2 = sel_registerName("dataTaskWithRequest:completionHandler:");
-    Method m2 = class_getInstanceMethod(cls, sel2);
-    if (m2) {
-        // Reuse same hook — it logs URL + body
-        static UploadIMP orig_data;
-        orig_data = (UploadIMP)method_getImplementation(m2);
-        // Can't easily hook this with separate orig — just log via method swizzle
-        emit(@"dataTask available (not hooked — upload hook covers it)");
-    }
+    emit(@"ObjC hooks done");
 }
 
 __attribute__((constructor))
